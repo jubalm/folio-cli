@@ -49,6 +49,22 @@ detect_store_name() {
   head -1 "$project_root/.folio"
 }
 
+# ── store (shared clone) ───────────────────────────────────────────
+
+ensure_base() {
+  local remote="${1:-$REMOTE_REPO}"
+  local base="$STORE_DIR/.main"
+
+  if [[ -d "$base/.git" ]]; then
+    git -C "$base" fetch origin main --quiet 2>/dev/null || true
+    return 0
+  fi
+
+  echo "Initializing shared clone..."
+  git clone --quiet "git@github.com:${remote}.git" "$base" || die \
+    "Failed to clone $remote."
+}
+
 # ── global gitignore ───────────────────────────────────────────────
 
 setup_global_gitignore() {
@@ -86,19 +102,20 @@ cmd_init() {
   # Check if already initialized from this directory
   local project_root
   project_root="$(detect_project_root)" && die \
-    "Already initialized ($project_root/.folio → $name)."
+    "Already initialized ($project_root/.folio → $(head -1 $project_root/.folio))."
 
   # Check for name collision
-  if [[ -d "$STORE_DIR/$name" ]]; then
+  if [[ -d "$STORE_DIR/$name" ]] && [[ "$name" != ".main" ]]; then
     die "Store '$name' already exists. Use --name to pick a different one."
   fi
 
   ensure_folio_home
   setup_global_gitignore
+  ensure_base "$REMOTE_REPO"
 
-  echo "Cloning $REMOTE_REPO into $STORE_DIR/$name/ ..."
-  git clone --depth 1 "git@github.com:$REMOTE_REPO.git" "$STORE_DIR/$name" || die \
-    "Failed to clone $REMOTE_REPO. Check network and GitHub SSH access."
+  echo "Adding worktree at $STORE_DIR/$name/ ..."
+  git -C "$STORE_DIR/.main" worktree add --detach "$STORE_DIR/$name" origin/main || die \
+    "Failed to create worktree. Check that $STORE_DIR/.main exists."
 
   echo "$name" > .folio
   echo "✓ Store ready. ($STORE_DIR/$name/)"
@@ -118,36 +135,13 @@ cmd_sync() {
 
   cd "$store"
 
-  # ── pull ──────────────────────────────────────────────────────
+  # ── fetch ──────────────────────────────────────────────────────
 
-  echo "Pulling main..."
+  ensure_base "$remote"
   git fetch origin main --quiet 2>/dev/null || die \
     "Cannot reach $remote. Check network."
-  local behind="$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
-  if [[ "$behind" -gt 0 ]]; then
-    git merge --ff-only origin/main || die \
-      "Cannot fast-forward. main has diverged — resolve manually in $store/."
-    echo "Fast-forwarded $behind commit(s)."
-  fi
 
   # ── surface open PRs ──────────────────────────────────────────
-
-  local orphan_branch
-  orphan_branch="$(git ls-remote origin "refs/heads/folio/sync-*" 2>/dev/null \
-    | head -1 | sed 's/.*refs\/heads\///')"
-
-  if [[ -n "$orphan_branch" ]]; then
-    echo "Resuming push on $orphan_branch..."
-    git checkout -b "$orphan_branch" "origin/$orphan_branch" 2>/dev/null || true
-    if gh pr list --head "$orphan_branch" --state open 2>/dev/null | grep -q .; then
-      echo "PR already exists for $orphan_branch. Cleaning up branch."
-      git checkout main
-      git branch -D "$orphan_branch" 2>/dev/null || true
-      return 0
-    fi
-    do_push "$remote" "$store" "$orphan_branch"
-    return $?
-  fi
 
   local prs
   prs="$(gh pr list --repo "$remote" --state open \
@@ -160,65 +154,94 @@ cmd_sync() {
     echo ""
   fi
 
-  # ── push ──────────────────────────────────────────────────────
+  local draft_branch="folio/$store_name"
+  local current_branch
+  current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
 
-  if git diff --quiet && git diff --cached --quiet && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
-    echo "Working tree clean. Nothing to push."
+  local dirty=false
+  if ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+    dirty=true
+  fi
+
+  # ── detached HEAD (clean slate) ──────────────────────────────────
+
+  if [[ "$current_branch" == "HEAD" ]]; then
+    if ! $dirty; then
+      git checkout --detach origin/main --quiet 2>/dev/null || true
+      echo "Nothing to push."
+      return 0
+    fi
+
+    # Resolve -m flag
+    local msg=""
+    if [[ "${1:-}" == "-m" ]]; then
+      msg="${2:-}"
+      [[ -z "$msg" ]] && die "Message required with -m."
+      shift 2 || true
+    else
+      echo -n "Message: "
+      read -r msg || true
+      [[ -z "$msg" ]] && msg="folio draft"
+    fi
+
+    echo "Creating draft..."
+    git checkout -b "$draft_branch" --quiet
+    git add -A
+    git commit -m "$msg" --quiet
+
+    echo "Pushing $draft_branch..."
+    git push -u origin "$draft_branch" --quiet 2>&1 || die "Push failed."
+
+    local pr_title="${msg%%$'\n'*}"
+    local pr_url
+    pr_url="$(gh pr create --repo "$remote" --base main --head "$draft_branch" \
+      --draft --title "$pr_title" --body "$msg" 2>&1)" || die \
+      "PR creation failed."
+
+    local pr_num="$(echo "$pr_url" | grep -oE '[0-9]+$' || echo "")"
+    echo "✓ Draft PR #$pr_num opened"
     return 0
   fi
 
-  echo -e "\nProject: $project_root"
-  echo "Changes:"
-  git status --short
+  # ── on draft branch ──────────────────────────────────────────────
 
-  local msg=""
-  if [[ "${1:-}" == "-m" ]]; then
-    msg="${2:-}"
-    [[ -z "$msg" ]] && die "Message required with -m."
-    shift 2 || true
-  else
-    echo ""
-    echo -n "Message: "
-    read -r msg
-    [[ -z "$msg" ]] && die "Message required."
-  fi
+  if [[ "$current_branch" == "$draft_branch" ]]; then
+    local pr_num
+    pr_num="$(gh pr list --repo "$remote" --head "$draft_branch" --state open \
+      --json number --jq '.[0].number' 2>/dev/null || echo "")"
 
-  local branch="folio/sync-$(date +%s)"
-  do_push "$remote" "$store" "$branch" "$msg"
-}
+    if [[ -z "$pr_num" ]]; then
+      # PR was merged or closed — reset
+      echo "Draft completed. Resetting..."
+      git checkout --detach origin/main --quiet 2>/dev/null || true
+      git branch -D "$draft_branch" --quiet 2>/dev/null || true
+      echo "Ready for next round."
+      return 0
+    fi
 
-do_push() {
-  local remote="$1" store="$2" branch="$3" msg="${4:-resumed push}"
-  cd "$store"
+    # PR is open
+    if ! $dirty; then
+      echo "Draft up to date (PR #$pr_num)."
+      return 0
+    fi
 
-  if [[ "$(git branch --show-current)" != "$branch" ]]; then
+    echo "Updating draft PR #$pr_num..."
     git add -A
-    git checkout -b "$branch"
-    git commit -m "$msg"
+
+    local update_msg="draft update"
+    if [[ "${1:-}" == "-m" ]]; then
+      update_msg="${2:-draft update}"
+    fi
+
+    git commit -m "$update_msg" --quiet
+    git push origin "$draft_branch" --quiet 2>&1 || die "Push failed."
+    echo "✓ Draft updated (PR #$pr_num)."
+    return 0
   fi
 
-  echo "Pushing $branch..."
-  git push -u origin "$branch" 2>&1 || die \
-    "Push failed. Check network."
+  # ── unknown branch ───────────────────────────────────────────────
 
-  local title="${msg%%$'\n'*}"
-  local pr_url
-  pr_url="$(gh pr create --repo "$remote" --base main --head "$branch" \
-    --title "$title" --body "$msg" 2>&1)" || die \
-    "PR creation failed. Branch $branch is on remote."$'\n'\
-    "Re-run 'folio sync' to resume."
-
-  local pr_num
-  pr_num="$(echo "$pr_url" | grep -oE '[0-9]+$' || echo "")"
-
-  git checkout main
-  git branch -D "$branch" 2>/dev/null || true
-
-  echo ""
-  echo "✓ $(echo "$pr_url" | head -1)"
-  if [[ -n "$pr_num" ]]; then
-    echo "  https://github.com/$remote/pull/$pr_num"
-  fi
+  die "Unexpected branch: $current_branch. Run 'git checkout --detach origin/main' in $store/ manually."
 }
 
 # ── list ───────────────────────────────────────────────────────────
@@ -226,25 +249,32 @@ do_push() {
 cmd_list() {
   ensure_folio_home
 
-  if [[ ! -d "$STORE_DIR" ]] || [[ -z "$(ls -A "$STORE_DIR" 2>/dev/null)" ]]; then
-    echo "No stores. Run 'folio init' from a project directory."
-    return 0
-  fi
-
+  local found=false
   printf "  %-25s %-8s %s\n" "STORE" "STATUS" "BRANCH"
-  for store in "$STORE_DIR"/*/; do
-    local name="$(basename "$store")"
-    local status="clean"
-    local branch="main"
 
-    cd "$store"
-    if ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+  for store in "$STORE_DIR"/*/; do
+    [[ -d "$store" ]] || continue
+    local name="$(basename "$store")"
+    [[ "$name" == ".main" ]] && continue
+
+    found=true
+    local status="clean"
+    local branch="detach"
+
+    if ! git -C "$store" diff --quiet || \
+       ! git -C "$store" diff --cached --quiet || \
+       [[ -n "$(git -C "$store" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
       status="dirty"
     fi
-    branch="$(git branch --show-current 2>/dev/null || echo "?")"
+    branch="$(git -C "$store" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")"
+    [[ "$branch" == "HEAD" ]] && branch="detach"
 
     printf "  %-25s %-8s %s\n" "$name" "$status" "$branch"
   done
+
+  if ! $found; then
+    echo "No stores. Run 'folio init' from a project directory."
+  fi
 }
 
 # ── status ─────────────────────────────────────────────────────────
@@ -259,20 +289,28 @@ cmd_status() {
   echo "Project:  $project_root"
   echo "Store:    $store"
 
-  cd "$store"
+  git -C "$store" rev-parse --git-dir &>/dev/null || die \
+    "Store at $store is not a valid git worktree."
 
-  if git diff --quiet && git diff --cached --quiet && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
+  if git -C "$store" diff --quiet && git -C "$store" diff --cached --quiet && \
+     [[ -z "$(git -C "$store" ls-files --others --exclude-standard)" ]]; then
     echo "Status:   clean"
   else
     echo "Status:   dirty"
-    git status --short
+    git -C "$store" status --short
   fi
+
+  local branch
+  branch="$(git -C "$store" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")"
+  [[ "$branch" == "HEAD" ]] && branch="detached"
+  echo "Branch:   $branch"
 
   # Check behind from last fetch (no network call)
   local behind=0
-  if git rev-parse --verify origin/main &>/dev/null; then
-    behind="$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
+  if git -C "$store" rev-parse --verify origin/main &>/dev/null; then
+    behind="$(git -C "$store" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
   fi
+  [[ "$behind" -gt 0 ]] && echo "Behind:   $behind commit(s)"
 }
 
 # ── config ──────────────────────────────────────────────────────────
@@ -317,15 +355,16 @@ folio — knowledge management over git
 Usage:
   folio init              Initialize a store for this project
   folio init --name <n>   Initialize with explicit store name
-  folio sync              Pull main + publish local edits via PR
-  folio sync -m "msg"     Publish with inline message (non-interactive)
+  folio sync              Push draft PR (create or update)
+  folio sync -m "msg"     With inline message
   folio list              List all stores
   folio status            Show current project/store status
   folio config            Show global config
   folio config <key>      Get a config value
   folio config <key> <v>  Set a config value
 
-Edit leaves directly in $STORE_DIR/<name>/.
+Edits happen in $STORE_DIR/<name>/leaves/.
+folio sync opens a draft PR; you merge when ready.
 EOF
     exit 1
     ;;
