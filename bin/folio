@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ── folio — knowledge management CLI ───────────────────────────────
+# User-scoped. Stores live in ~/.config/folio/stores/.
+# Projects carry a .folio pointer file (just the store name).
+# The CLI is a git shortcut, not a content processor.
+# ───────────────────────────────────────────────────────────────────
+
+FOLIO_HOME="$HOME/.config/folio"
+STORE_DIR="$FOLIO_HOME/stores"
+CONFIG_FILE="$FOLIO_HOME/config.yml"
+REMOTE_REPO="jubalm/folio"
+
+# ── helpers ────────────────────────────────────────────────────────
+
+die() { echo "folio: $*" >&2; exit 1; }
+
+ensure_folio_home() {
+  mkdir -p "$FOLIO_HOME" "$STORE_DIR"
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    cat > "$CONFIG_FILE" <<EOF
+remote: $REMOTE_REPO
+store: git
+EOF
+  fi
+}
+
+read_config() {
+  local key="$1"
+  grep "^$key:" "$CONFIG_FILE" | head -1 | sed "s/^$key: *//"
+}
+
+detect_project_root() {
+  local dir="$PWD"
+  while [[ "$dir" != "/" ]]; do
+    if [[ -f "$dir/.folio" ]]; then
+      echo "$dir"
+      return 0
+    fi
+    dir="$(dirname "$dir")"
+  done
+  return 1
+}
+
+detect_store_name() {
+  local project_root
+  project_root="$(detect_project_root)" || return 1
+  head -1 "$project_root/.folio"
+}
+
+# ── global gitignore ───────────────────────────────────────────────
+
+setup_global_gitignore() {
+  local gi
+  gi="$(git config --global core.excludesFile 2>/dev/null || echo "")"
+
+  # Nothing configured — pick a default and set it
+  if [[ -z "$gi" ]]; then
+    gi="$HOME/.gitignore_global"
+    git config --global core.excludesFile "$gi"
+  fi
+
+  # Resolve ~ and $HOME if git stored a literal path
+  gi="${gi/#\~/$HOME}"
+
+  touch "$gi"
+  grep -qx ".folio" "$gi" && return 0
+
+  # Ensure trailing newline if file has content
+  [[ -s "$gi" ]] && echo "" >> "$gi"
+  echo ".folio" >> "$gi"
+}
+
+# ── init ───────────────────────────────────────────────────────────
+
+cmd_init() {
+  local name=""
+  if [[ "${1:-}" == "--name" ]]; then
+    name="${2:-}"
+    [[ -z "$name" ]] && die "Store name required with --name."
+  else
+    name="$(basename "$PWD")"
+  fi
+
+  # Check if already initialized from this directory
+  local project_root
+  project_root="$(detect_project_root)" && die \
+    "Already initialized ($project_root/.folio → $name)."
+
+  # Check for name collision
+  if [[ -d "$STORE_DIR/$name" ]]; then
+    die "Store '$name' already exists. Use --name to pick a different one."
+  fi
+
+  ensure_folio_home
+  setup_global_gitignore
+
+  echo "Cloning $REMOTE_REPO into $STORE_DIR/$name/ ..."
+  git clone --depth 1 "git@github.com:$REMOTE_REPO.git" "$STORE_DIR/$name" || die \
+    "Failed to clone $REMOTE_REPO. Check network and GitHub SSH access."
+
+  echo "$name" > .folio
+  echo "✓ Store ready. ($STORE_DIR/$name/)"
+}
+
+# ── sync ────────────────────────────────────────────────────────────
+
+cmd_sync() {
+  local project_root store_name store remote
+  project_root="$(detect_project_root)" || die \
+    "Not initialized. Run 'folio init' from this directory."
+  store_name="$(detect_store_name)"
+  store="$STORE_DIR/$store_name"
+  remote="$(read_config remote)"
+
+  [[ -d "$store" ]] || die "Store '$store_name' not found at $store/. Run 'folio init'."
+
+  cd "$store"
+
+  # ── pull ──────────────────────────────────────────────────────
+
+  echo "Pulling main..."
+  git fetch origin main --quiet 2>/dev/null || die \
+    "Cannot reach $remote. Check network."
+  local behind="$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
+  if [[ "$behind" -gt 0 ]]; then
+    git merge --ff-only origin/main || die \
+      "Cannot fast-forward. main has diverged — resolve manually in $store/."
+    echo "Fast-forwarded $behind commit(s)."
+  fi
+
+  # ── surface open PRs ──────────────────────────────────────────
+
+  local orphan_branch
+  orphan_branch="$(git ls-remote origin "refs/heads/folio/sync-*" 2>/dev/null \
+    | head -1 | sed 's/.*refs\/heads\///')"
+
+  if [[ -n "$orphan_branch" ]]; then
+    echo "Resuming push on $orphan_branch..."
+    git checkout -b "$orphan_branch" "origin/$orphan_branch" 2>/dev/null || true
+    if gh pr list --head "$orphan_branch" --state open 2>/dev/null | grep -q .; then
+      echo "PR already exists for $orphan_branch. Cleaning up branch."
+      git checkout main
+      git branch -D "$orphan_branch" 2>/dev/null || true
+      return 0
+    fi
+    do_push "$remote" "$store" "$orphan_branch"
+    return $?
+  fi
+
+  local prs
+  prs="$(gh pr list --repo "$remote" --state open \
+    --json number,title,headRefName --jq \
+    '.[] | "  #\(.number)  \(.title)  (\(.headRefName))"' 2>/dev/null || echo "")"
+
+  if [[ -n "$prs" ]]; then
+    echo "Open PRs:"
+    echo "$prs"
+    echo ""
+  fi
+
+  # ── push ──────────────────────────────────────────────────────
+
+  if git diff --quiet && git diff --cached --quiet && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
+    echo "Working tree clean. Nothing to push."
+    return 0
+  fi
+
+  echo -e "\nProject: $project_root"
+  echo "Changes:"
+  git status --short
+
+  local msg=""
+  if [[ "${1:-}" == "-m" ]]; then
+    msg="${2:-}"
+    [[ -z "$msg" ]] && die "Message required with -m."
+    shift 2 || true
+  else
+    echo ""
+    echo -n "Message: "
+    read -r msg
+    [[ -z "$msg" ]] && die "Message required."
+  fi
+
+  local branch="folio/sync-$(date +%s)"
+  do_push "$remote" "$store" "$branch" "$msg"
+}
+
+do_push() {
+  local remote="$1" store="$2" branch="$3" msg="${4:-resumed push}"
+  cd "$store"
+
+  if [[ "$(git branch --show-current)" != "$branch" ]]; then
+    git add -A
+    git checkout -b "$branch"
+    git commit -m "$msg"
+  fi
+
+  echo "Pushing $branch..."
+  git push -u origin "$branch" 2>&1 || die \
+    "Push failed. Check network."
+
+  local title="${msg%%$'\n'*}"
+  local pr_url
+  pr_url="$(gh pr create --repo "$remote" --base main --head "$branch" \
+    --title "$title" --body "$msg" 2>&1)" || die \
+    "PR creation failed. Branch $branch is on remote."$'\n'\
+    "Re-run 'folio sync' to resume."
+
+  local pr_num
+  pr_num="$(echo "$pr_url" | grep -oE '[0-9]+$' || echo "")"
+
+  git checkout main
+  git branch -D "$branch" 2>/dev/null || true
+
+  echo ""
+  echo "✓ $(echo "$pr_url" | head -1)"
+  if [[ -n "$pr_num" ]]; then
+    echo "  https://github.com/$remote/pull/$pr_num"
+  fi
+}
+
+# ── list ───────────────────────────────────────────────────────────
+
+cmd_list() {
+  ensure_folio_home
+
+  if [[ ! -d "$STORE_DIR" ]] || [[ -z "$(ls -A "$STORE_DIR" 2>/dev/null)" ]]; then
+    echo "No stores. Run 'folio init' from a project directory."
+    return 0
+  fi
+
+  printf "  %-25s %-8s %s\n" "STORE" "STATUS" "BRANCH"
+  for store in "$STORE_DIR"/*/; do
+    local name="$(basename "$store")"
+    local status="clean"
+    local branch="main"
+
+    cd "$store"
+    if ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+      status="dirty"
+    fi
+    branch="$(git branch --show-current 2>/dev/null || echo "?")"
+
+    printf "  %-25s %-8s %s\n" "$name" "$status" "$branch"
+  done
+}
+
+# ── status ─────────────────────────────────────────────────────────
+
+cmd_status() {
+  local project_root store_name
+  project_root="$(detect_project_root)" || die \
+    "Not initialized. Run 'folio init' from this directory."
+  store_name="$(detect_store_name)"
+  local store="$STORE_DIR/$store_name"
+
+  echo "Project:  $project_root"
+  echo "Store:    $store"
+
+  cd "$store"
+
+  if git diff --quiet && git diff --cached --quiet && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
+    echo "Status:   clean"
+  else
+    echo "Status:   dirty"
+    git status --short
+  fi
+
+  # Check behind from last fetch (no network call)
+  local behind=0
+  if git rev-parse --verify origin/main &>/dev/null; then
+    behind="$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
+  fi
+}
+
+# ── config ──────────────────────────────────────────────────────────
+
+cmd_config() {
+  ensure_folio_home
+  local key="${1:-}"
+  local value="${2:-}"
+
+  if [[ -z "$key" ]]; then
+    # Print all
+    cat "$CONFIG_FILE"
+    return 0
+  fi
+
+  if [[ -z "$value" ]]; then
+    # Get
+    read_config "$key"
+    return 0
+  fi
+
+  # Set
+  if grep -q "^$key:" "$CONFIG_FILE"; then
+    sed -i '' "s|^$key:.*|$key: $value|" "$CONFIG_FILE"
+  else
+    echo "$key: $value" >> "$CONFIG_FILE"
+  fi
+}
+
+# ── dispatch ───────────────────────────────────────────────────────
+
+case "${1:-}" in
+  init)   shift; cmd_init "$@" ;;
+  sync)   shift; cmd_sync "$@" ;;
+  list)   shift; cmd_list "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  config) shift; cmd_config "$@" ;;
+  *)
+    cat <<EOF
+folio — knowledge management over git
+
+Usage:
+  folio init              Initialize a store for this project
+  folio init --name <n>   Initialize with explicit store name
+  folio sync              Pull main + publish local edits via PR
+  folio sync -m "msg"     Publish with inline message (non-interactive)
+  folio list              List all stores
+  folio status            Show current project/store status
+  folio config            Show global config
+  folio config <key>      Get a config value
+  folio config <key> <v>  Set a config value
+
+Edit leaves directly in $STORE_DIR/<name>/.
+EOF
+    exit 1
+    ;;
+esac
