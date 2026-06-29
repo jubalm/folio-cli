@@ -49,6 +49,13 @@ detect_store_name() {
   head -1 "$project_root/.folio"
 }
 
+# ── store name ─────────────────────────────────────────────────────
+
+make_store_name() {
+  local seed="${1:-$PWD}"
+  echo "$seed" | md5 | cut -c1-8
+}
+
 # ── store (shared clone) ───────────────────────────────────────────
 
 ensure_base() {
@@ -63,6 +70,7 @@ ensure_base() {
   echo "Initializing shared clone..."
   git clone --quiet "git@github.com:${remote}.git" "$base" || die \
     "Failed to clone $remote."
+  git -C "$base" config extensions.worktreeConfig true
 }
 
 # ── global gitignore ───────────────────────────────────────────────
@@ -91,22 +99,25 @@ setup_global_gitignore() {
 # ── init ───────────────────────────────────────────────────────────
 
 cmd_init() {
-  local name=""
-  if [[ "${1:-}" == "--name" ]]; then
-    name="${2:-}"
-    [[ -z "$name" ]] && die "Store name required with --name."
-  else
-    name="$(basename "$PWD")"
+  local label=""
+  if [[ "${1:-}" == "--label" ]] || [[ "${1:-}" == "--name" ]]; then
+    label="${2:-}"
+    [[ -z "$label" ]] && die "Label required with ${1}."
+    shift 2 || true
   fi
+  [[ -z "$label" ]] && label="$(basename "$PWD")"
 
   # Check if already initialized from this directory
   local project_root
   project_root="$(detect_project_root)" && die \
     "Already initialized ($project_root/.folio → $(head -1 $project_root/.folio))."
 
-  # Check for name collision
+  local name
+  name="$(make_store_name)"
+
+  # Hash collision is astronomically unlikely — guard just in case
   if [[ -d "$STORE_DIR/$name" ]] && [[ "$name" != ".main" ]]; then
-    die "Store '$name' already exists. Use --name to pick a different one."
+    die "Store collision: $name (extremely unlikely)."
   fi
 
   ensure_folio_home
@@ -117,8 +128,10 @@ cmd_init() {
   git -C "$STORE_DIR/.main" worktree add --detach "$STORE_DIR/$name" origin/main || die \
     "Failed to create worktree. Check that $STORE_DIR/.main exists."
 
+  git -C "$STORE_DIR/$name" config --worktree folio.label "$label"
+
   echo "$name" > .folio
-  echo "✓ Store ready. ($STORE_DIR/$name/)"
+  echo "✓ Store ready ($label)."
 }
 
 # ── sync ────────────────────────────────────────────────────────────
@@ -250,7 +263,7 @@ cmd_list() {
   ensure_folio_home
 
   local found=false
-  printf "  %-25s %-8s %s\n" "STORE" "STATUS" "BRANCH"
+  printf "  %-12s %-22s %-8s %s\n" "STORE" "LABEL" "STATUS" "BRANCH"
 
   for store in "$STORE_DIR"/*/; do
     [[ -d "$store" ]] || continue
@@ -258,6 +271,7 @@ cmd_list() {
     [[ "$name" == ".main" ]] && continue
 
     found=true
+    local label="$(git -C "$store" config --worktree folio.label 2>/dev/null || echo "$name")"
     local status="clean"
     local branch="detach"
 
@@ -269,7 +283,7 @@ cmd_list() {
     branch="$(git -C "$store" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")"
     [[ "$branch" == "HEAD" ]] && branch="detach"
 
-    printf "  %-25s %-8s %s\n" "$name" "$status" "$branch"
+    printf "  %-12s %-22s %-8s %s\n" "$name" "$label" "$status" "$branch"
   done
 
   if ! $found; then
@@ -353,11 +367,10 @@ case "${1:-}" in
 folio — knowledge management over git
 
 Usage:
-  folio init              Initialize a store for this project
-  folio init --name <n>   Initialize with explicit store name
+  folio init [--label <n>]  Initialize a store for this project
   folio sync              Push draft PR (create or update)
   folio sync -m "msg"     With inline message
-  folio list              List all stores
+  folio list              List all stores (hash → label)
   folio status            Show current project/store status
   folio config            Show global config
   folio config <key>      Get a config value
