@@ -621,6 +621,328 @@ cmd_list() {
   fi
 }
 
+# ── dash ───────────────────────────────────────────────────────────
+
+cmd_dash() {
+  ensure_folio_home
+  [[ -d "$BASE_REPO/.git" ]] || ensure_base
+
+  if ! command -v node &>/dev/null; then
+    die "folio dash requires Node.js. Install from https://nodejs.org/ or via your package manager."
+  fi
+
+  local port="8765"
+  local no_open=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)
+        shift
+        [[ $# -gt 0 ]] || die "Usage: folio dash [--port <port>] [--no-open]"
+        port="$1"
+        shift
+        ;;
+      --no-open)
+        no_open=true
+        shift
+        ;;
+      *)
+        die "Usage: folio dash [--port <port>] [--no-open]"
+        ;;
+    esac
+  done
+
+  local token=""
+  if command -v openssl &>/dev/null; then
+    token="$(openssl rand -hex 16)"
+  else
+    token="$(date +%s)-$$"
+  fi
+
+  local script
+  script="$(mktemp "${TMPDIR:-/tmp}/folio-dash.XXXXXX")"
+  trap 'rm -f "$script"' EXIT
+
+  cat > "$script" <<'NODE'
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+const PORT = Number(process.env.FOLIO_DASH_PORT || 8765);
+const TOKEN = process.env.FOLIO_DASH_TOKEN;
+const FOLIO = process.env.FOLIO_BIN_SELF || 'folio';
+const FOLIO_HOME = process.env.FOLIO_HOME;
+const CONFIG_FILE = process.env.CONFIG_FILE;
+const BASE_REPO = process.env.BASE_REPO;
+const AMEND_DIR = process.env.AMEND_DIR;
+
+function sh(cmd, args, opts = {}) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', cwd: opts.cwd, env: process.env });
+  return { ok: r.status === 0, status: r.status, stdout: (r.stdout || '').trim(), stderr: (r.stderr || '').trim() };
+}
+function git(args, cwd = BASE_REPO) { return sh('git', args, { cwd }); }
+function gh(args) { return sh('gh', args); }
+function folio(args) { return sh(FOLIO, args); }
+function parseJson(text, fallback) { try { return JSON.parse(text); } catch { return fallback; } }
+function readConfig() {
+  const out = {};
+  try {
+    for (const line of fs.readFileSync(CONFIG_FILE, 'utf8').split(/\r?\n/)) {
+      const m = line.match(/^([^:#]+):\s*(.*)$/);
+      if (m) out[m[1].trim()] = m[2].trim();
+    }
+  } catch {}
+  return out;
+}
+function writeConfigKey(key, value) {
+  let text = '';
+  try { text = fs.readFileSync(CONFIG_FILE, 'utf8'); } catch {}
+  const re = new RegExp(`^${key}:.*$`, 'm');
+  if (re.test(text)) text = text.replace(re, `${key}: ${value}`);
+  else text += `${text.endsWith('\n') || !text ? '' : '\n'}${key}: ${value}\n`;
+  fs.writeFileSync(CONFIG_FILE, text);
+}
+function slug(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+}
+function topicFromBranch(branch) {
+  return String(branch || '').replace(/^amend\//, '').replace(/^folio\//, 'folio-');
+}
+function isDirty(cwd) {
+  return git(['status', '--porcelain'], cwd).stdout.length > 0;
+}
+function changedFiles(cwd) {
+  const base = git(['merge-base', 'HEAD', 'origin/main'], cwd).stdout || 'origin/main';
+  const committed = git(['diff', '--name-status', `${base}...HEAD`], cwd).stdout.split('\n').filter(Boolean);
+  const local = git(['status', '--porcelain'], cwd).stdout.split('\n').filter(Boolean);
+  return { committed, local };
+}
+function localAmendments() {
+  const rows = [];
+  if (!fs.existsSync(AMEND_DIR)) return rows;
+  for (const name of fs.readdirSync(AMEND_DIR)) {
+    const p = path.join(AMEND_DIR, name);
+    if (!fs.existsSync(path.join(p, '.git'))) continue;
+    const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], p).stdout;
+    const files = changedFiles(p);
+    rows.push({
+      topic: name,
+      branch,
+      path: p,
+      local: true,
+      dirty: isDirty(p),
+      changedCount: files.committed.length + files.local.length,
+      lastCommit: git(['log', '-1', '--pretty=%h %cr %s'], p).stdout,
+    });
+  }
+  return rows;
+}
+function openPrs(remote) {
+  if (!remote) return [];
+  const r = gh(['pr', 'list', '--repo', remote, '--state', 'open', '--json', 'number,title,headRefName,isDraft,url,updatedAt']);
+  return r.ok ? parseJson(r.stdout, []) : [];
+}
+function prForBranch(remote, branch) {
+  if (!remote || !branch) return null;
+  const r = gh(['pr', 'list', '--repo', remote, '--head', branch, '--state', 'all', '--json', 'number,title,headRefName,isDraft,state,url,updatedAt', '--jq', '.[0]']);
+  return r.ok && r.stdout && r.stdout !== 'null' ? parseJson(r.stdout, null) : null;
+}
+function combinedAmendments() {
+  const cfg = readConfig();
+  const byBranch = new Map();
+  for (const a of localAmendments()) {
+    const pr = prForBranch(cfg.remote, a.branch);
+    byBranch.set(a.branch, { ...a, pr });
+  }
+  for (const pr of openPrs(cfg.remote)) {
+    if (byBranch.has(pr.headRefName)) {
+      byBranch.set(pr.headRefName, { ...byBranch.get(pr.headRefName), pr });
+    } else {
+      byBranch.set(pr.headRefName, {
+        topic: topicFromBranch(pr.headRefName),
+        branch: pr.headRefName,
+        local: false,
+        dirty: false,
+        changedCount: null,
+        lastCommit: '',
+        pr,
+      });
+    }
+  }
+  return [...byBranch.values()].sort((a, b) => String(b.pr?.updatedAt || '').localeCompare(String(a.pr?.updatedAt || '')));
+}
+function status() {
+  const cfg = readConfig();
+  const rev = git(['rev-parse', '--short', 'HEAD']).stdout;
+  const origin = git(['rev-parse', '--short', 'origin/main']).stdout;
+  const counts = git(['rev-list', '--left-right', '--count', 'HEAD...origin/main']).stdout.split(/\s+/);
+  const prs = openPrs(cfg.remote);
+  return {
+    config: cfg,
+    baseRepo: BASE_REPO,
+    active: cfg.active || '',
+    main: { rev, origin, ahead: Number(counts[0] || 0), behind: Number(counts[1] || 0), dirty: isDirty(BASE_REPO) },
+    gh: gh(['auth', 'status']).ok,
+    openPrCount: prs.length,
+    localAmendmentCount: localAmendments().length,
+  };
+}
+function detail(query) {
+  const cfg = readConfig();
+  const topic = slug(query.get('topic') || '');
+  const prNum = query.get('pr') || '';
+  const item = combinedAmendments().find(a => a.topic === topic || String(a.pr?.number || '') === prNum || a.branch === query.get('branch'));
+  if (!item) throw Object.assign(new Error('amendment not found'), { status: 404 });
+  const out = { item, files: { committed: [], local: [] }, diff: '', pr: item.pr || null, comments: [] };
+  if (item.local && item.path) {
+    out.files = changedFiles(item.path);
+    const base = git(['merge-base', 'HEAD', 'origin/main'], item.path).stdout || 'origin/main';
+    out.diff = git(['diff', '--find-renames', `${base}...HEAD`], item.path).stdout || '(no committed diff)';
+    if (isDirty(item.path)) {
+      const localDiff = git(['diff'], item.path).stdout;
+      if (localDiff) out.diff += `\n\n--- uncommitted diff ---\n${localDiff}`;
+    }
+  } else if (item.pr?.number) {
+    out.diff = gh(['pr', 'diff', String(item.pr.number), '--repo', cfg.remote]).stdout;
+  }
+  if (item.pr?.number) {
+    const view = gh(['pr', 'view', String(item.pr.number), '--repo', cfg.remote, '--json', 'number,title,body,state,isDraft,url,headRefName,comments,reviews']);
+    if (view.ok) out.pr = parseJson(view.stdout, item.pr);
+  }
+  return out;
+}
+function cleanupMergedLocal() {
+  const removed = [];
+  git(['fetch', 'origin', 'main', '--quiet']);
+  for (const a of localAmendments()) {
+    if (!a.branch || a.branch === 'HEAD') continue;
+    const merged = git(['branch', '-r', '--merged', 'origin/main'], BASE_REPO).stdout.includes(`origin/${a.branch}`);
+    const pr = prForBranch(readConfig().remote, a.branch);
+    if (merged || pr?.state === 'MERGED' || pr?.state === 'CLOSED') {
+      git(['worktree', 'remove', a.path, '--force'], BASE_REPO);
+      removed.push(a.topic);
+      if (readConfig().active === a.topic) writeConfigKey('active', '');
+    }
+  }
+  git(['worktree', 'prune'], BASE_REPO);
+  return { removed };
+}
+function act(payload) {
+  const cfg = readConfig();
+  const action = payload.action;
+  if (action === 'sync-main') return folio(['sync']);
+  if (action === 'sync-amendment') {
+    if (!payload.topic) throw new Error('topic required');
+    writeConfigKey('active', slug(payload.topic));
+    return folio(['sync', '-m', payload.message || `folio dash: sync ${slug(payload.topic)}`]);
+  }
+  if (action === 'ready') {
+    if (!payload.pr) throw new Error('pr required');
+    return gh(['pr', 'ready', String(payload.pr), '--repo', cfg.remote]);
+  }
+  if (action === 'merge') {
+    if (!payload.pr || payload.confirm !== `merge #${payload.pr}`) throw new Error(`confirmation required: merge #${payload.pr}`);
+    const view = gh(['pr', 'view', String(payload.pr), '--repo', cfg.remote, '--json', 'title,body,headRefName']);
+    if (!view.ok) return view;
+    const pr = parseJson(view.stdout, {});
+    const merge = gh(['pr', 'merge', String(payload.pr), '--repo', cfg.remote, '--squash', '--delete-branch', '--subject', `${pr.title} (#${payload.pr})`, '--body', pr.body || '']);
+    if (!merge.ok) return merge;
+    git(['pull', '--ff-only', 'origin', 'main', '--quiet'], BASE_REPO);
+    const topic = topicFromBranch(pr.headRefName);
+    const p = path.join(AMEND_DIR, slug(topic));
+    if (fs.existsSync(p)) git(['worktree', 'remove', p, '--force'], BASE_REPO);
+    if (readConfig().active === slug(topic)) writeConfigKey('active', '');
+    return merge;
+  }
+  if (action === 'drop') {
+    if (!payload.topic || payload.confirm !== `drop ${slug(payload.topic)}`) throw new Error(`confirmation required: drop ${slug(payload.topic)}`);
+    return folio(['drop', slug(payload.topic), '--force']);
+  }
+  if (action === 'cleanup') {
+    if (payload.confirm !== 'cleanup') throw new Error('confirmation required: cleanup');
+    return cleanupMergedLocal();
+  }
+  throw new Error('unknown action');
+}
+function send(res, code, data) {
+  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(data, null, 2));
+}
+function requireToken(req, url) {
+  const header = req.headers['x-folio-token'];
+  const query = url.searchParams.get('token');
+  return header === TOKEN || query === TOKEN;
+}
+function html() { return `<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Folio Dash</title>
+<style>
+body{font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#111;color:#eee}header{padding:16px 20px;border-bottom:1px solid #333;display:flex;gap:16px;align-items:center}button{background:#eee;color:#111;border:0;border-radius:6px;padding:7px 10px;cursor:pointer}button.danger{background:#ff6b6b}button.warn{background:#ffd166}.wrap{display:grid;grid-template-columns:380px 1fr;min-height:calc(100vh - 65px)}aside{border-right:1px solid #333;padding:16px;overflow:auto}.main{padding:16px;overflow:auto}.card{background:#1b1b1b;border:1px solid #333;border-radius:10px;padding:12px;margin-bottom:12px}.row{padding:10px;border:1px solid #333;border-radius:8px;margin:8px 0;cursor:pointer}.row:hover{background:#222}.muted{color:#aaa}.pill{display:inline-block;border:1px solid #555;border-radius:999px;padding:1px 7px;margin-left:4px;color:#ccc}.dirty{color:#ffd166}.draft{color:#80c7ff}.ready{color:#9cff9c}a{color:#80c7ff}pre{white-space:pre-wrap;background:#050505;border:1px solid #333;border-radius:8px;padding:12px;overflow:auto;max-height:60vh}.actions{display:flex;gap:8px;flex-wrap:wrap}</style>
+</head><body><header><h2 style="margin:0">Folio Dash</h2><span id="health" class="muted">loading…</span><button onclick="loadAll()">Refresh</button><button onclick="action({action:'sync-main'})">Sync main</button><button class="warn" onclick="cleanup()">Cleanup</button></header>
+<div class="wrap"><aside><div id="status" class="card"></div><h3>Amendments / PRs</h3><div id="list"></div></aside><main class="main"><div id="detail" class="card">Select an amendment or PR.</div></main></div>
+<script>
+var token = new URLSearchParams(location.search).get('token');
+function esc(s){return String(s == null ? '' : s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+async function api(path, opts){opts=opts||{};opts.headers=Object.assign({},opts.headers||{}, {'x-folio-token':token}); if(opts.body && typeof opts.body !== 'string'){opts.headers['content-type']='application/json';opts.body=JSON.stringify(opts.body)} var r=await fetch(path,opts); var j=await r.json(); if(!r.ok) throw new Error(j.error||r.statusText); return j;}
+async function loadAll(){
+  var st=await api('/api/status');
+  document.getElementById('health').textContent=(st.config.remote||'unbound')+' · main '+st.main.rev+(st.main.behind?' · behind '+st.main.behind:'')+(st.active?' · active '+st.active:'');
+  document.getElementById('status').innerHTML='<b>Status</b><br>Remote: '+esc(st.config.remote)+'<br>Main: '+esc(st.main.rev)+' / origin '+esc(st.main.origin)+'<br>Ahead/behind: '+st.main.ahead+'/'+st.main.behind+'<br>Open PRs: '+st.openPrCount+'<br>Local amendments: '+st.localAmendmentCount+'<br>gh auth: '+(st.gh?'ok':'missing');
+  var rows=await api('/api/amendments');
+  document.getElementById('list').innerHTML=rows.map(function(r){return '<div class="row" onclick="show(\''+esc(r.topic)+'\',\''+esc((r.pr&&r.pr.number)||'')+'\')"><b>'+esc(r.topic)+'</b> '+((r.pr&&r.pr.isDraft)?'<span class="pill draft">draft</span>':'')+(r.dirty?'<span class="pill dirty">dirty</span>':'')+(!r.local?'<span class="pill">remote-only</span>':'')+'<br><span class="muted">'+esc(r.branch)+' '+(r.pr?'· #'+r.pr.number+' '+esc(r.pr.title):'· local only')+'</span></div>'}).join('') || '<p class="muted">No amendments.</p>';
+}
+async function show(topic, pr){
+  var d=await api('/api/detail?topic='+encodeURIComponent(topic)+'&pr='+encodeURIComponent(pr)); var p=d.pr||{};
+  var actions='<div class="actions"><button onclick="action({action:\'sync-amendment\',topic:\''+esc(d.item.topic)+'\'})">Sync</button>';
+  if(p.number){actions += '<button onclick="action({action:\'ready\',pr:'+p.number+'})">Mark ready</button><button class="danger" onclick="mergePr('+p.number+')">Squash merge</button>';}
+  actions += '<button class="danger" onclick="dropTopic(\''+esc(d.item.topic)+'\')">Drop</button></div>';
+  document.getElementById('detail').innerHTML='<h2>'+esc(d.item.topic)+' '+(p.number?'<span class="pill">#'+p.number+'</span>':'')+'</h2><p class="muted">'+esc(d.item.branch)+' '+(d.item.local?'· '+esc(d.item.path):'· remote-only')+'</p><p>'+(p.url?'<a href="'+esc(p.url)+'">Open on GitHub</a>':'')+'</p>'+actions+'<h3>Files</h3><pre>'+esc([].concat(d.files.committed||[],d.files.local||[]).join('\n')||'(none)')+'</pre><h3>PR body</h3><pre>'+esc(p.body||'(no PR body)')+'</pre><h3>Diff</h3><pre>'+esc(d.diff||'(no diff)')+'</pre>';
+}
+async function action(body){try{var out=await api('/api/action',{method:'POST',body:body}); alert(out.stdout||JSON.stringify(out)); await loadAll();}catch(e){alert(e.message)}}
+function mergePr(pr){var c=prompt('Type: merge #'+pr); if(c) action({action:'merge',pr:pr,confirm:c});}
+function dropTopic(topic){var c=prompt('Type: drop '+topic); if(c) action({action:'drop',topic:topic,confirm:c});}
+function cleanup(){var c=prompt('Type: cleanup'); if(c) action({action:'cleanup',confirm:c});}
+loadAll().catch(function(e){document.getElementById('health').textContent=e.message});
+</script></body></html>`; }
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+  if (!requireToken(req, url)) return send(res, 403, { error: 'bad token' });
+  try {
+    if (req.method === 'GET' && url.pathname === '/') { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); return res.end(html()); }
+    if (req.method === 'GET' && url.pathname === '/api/status') return send(res, 200, status());
+    if (req.method === 'GET' && url.pathname === '/api/amendments') return send(res, 200, combinedAmendments());
+    if (req.method === 'GET' && url.pathname === '/api/detail') return send(res, 200, detail(url.searchParams));
+    if (req.method === 'POST' && url.pathname === '/api/action') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => { try { send(res, 200, act(parseJson(body, {}))); } catch (e) { send(res, e.status || 400, { error: e.message }); } });
+      return;
+    }
+    send(res, 404, { error: 'not found' });
+  } catch (e) { send(res, e.status || 500, { error: e.message }); }
+});
+server.listen(PORT, '127.0.0.1');
+NODE
+
+  local url="http://127.0.0.1:${port}/?token=${token}"
+  echo "folio dash: $url"
+  echo "Ctrl-C to stop."
+  if ! $no_open && command -v open &>/dev/null; then
+    open "$url" >/dev/null 2>&1 || true
+  fi
+
+  FOLIO_DASH_PORT="$port" \
+  FOLIO_DASH_TOKEN="$token" \
+  FOLIO_HOME="$FOLIO_HOME" \
+  CONFIG_FILE="$CONFIG_FILE" \
+  BASE_REPO="$BASE_REPO" \
+  AMEND_DIR="$AMEND_DIR" \
+  FOLIO_BIN_SELF="$0" \
+  node "$script"
+}
+
 # ── config ─────────────────────────────────────────────────────────
 
 cmd_config() {
@@ -651,6 +973,7 @@ case "${1:-}" in
   list)   shift; cmd_list "$@" ;;
   status) shift; cmd_status "$@" ;;
   config) shift; cmd_config "$@" ;;
+  dash)   shift; cmd_dash "$@" ;;
   *)
     cat <<EOF
 folio — knowledge management CLI
@@ -665,9 +988,10 @@ Usage:
   folio drop <topic> --force   Delete an amendment (local + remote)
   folio config                 Show global config
   folio config <key> <value>   Set config value
+  folio dash [--no-open]       Launch local review/merge dashboard
 
-Edits go in ~/.config/folio/store/amendments/<topic>/leaves/.
-folio sync opens a draft PR; merge via web dashboard.
+Edits go in ~/.config/folio/stores/amendments/<topic>/leaves/.
+folio sync opens a draft PR; merge via folio dash.
 EOF
     exit 1
     ;;

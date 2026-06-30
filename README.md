@@ -6,7 +6,7 @@ Knowledge management over git. A bash CLI — the sole interface to the folio kn
 curl -fsSL https://raw.githubusercontent.com/jubalm/folio-cli/main/install.sh | bash
 ```
 
-Requires: `git`, `gh` (GitHub CLI, authenticated).
+Requires: `git`, `gh` (GitHub CLI, authenticated). `folio dash` additionally requires `node`.
 
 ## Commands
 
@@ -22,6 +22,7 @@ folio drop <topic> --force   Abandon an amendment (local + remote)
 folio config                 Show global config
 folio config <key> [<val>]   Get or set a config value
 folio list                   List all amendments with status and PR
+folio dash [--no-open]       Launch local review/merge dashboard
 ```
 
 ## Quick start
@@ -43,9 +44,19 @@ folio sync -m "why this matters"   # submits a draft PR
 folio drop my-topic --force
 ```
 
+## Dash
+
+```bash
+folio dash                 # start tokenized localhost dashboard + open browser
+folio dash --no-open       # print URL only (headless-safe)
+folio dash --port 8765     # explicit port
+```
+
+Dash is the human review/control surface: Folio health, amendment/PR inbox, PR details with changed files + diffs, squash-merge, drop, and cleanup controls. It binds to `127.0.0.1` and requires the random token printed in the URL. Editing stays out of scope; edit Markdown in amendment worktrees.
+
 ## How it works
 
-A 674-line bash script wrapping `git` and `gh`. No daemon, no database. Amendments are git worktrees of a single canonical clone at `~/.config/folio/stores/.main/`. Each amendment lives in `stores/amendments/<topic>/` and syncs as its own draft PR. Rebase-always keeps knowledge history linear. The PR body IS the editorial record.
+A bash CLI wrapping `git` and `gh`, with an embedded Node server for `folio dash`. No daemon, no database. Amendments are git worktrees of a single canonical clone at `~/.config/folio/stores/.main/`. Each amendment lives in `stores/amendments/<topic>/` and syncs as its own draft PR. Rebase-always keeps knowledge history linear. The PR body IS the editorial record.
 
 ## Upgrade
 
