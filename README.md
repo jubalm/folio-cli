@@ -1,6 +1,6 @@
 # folio-cli
 
-Knowledge management over git. A bash CLI that collapses 11 git/gh commands into one verb.
+Knowledge management over git. A bash CLI — the sole interface to the folio knowledgebase. No `.folio` files, no project binding, works from anywhere.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jubalm/folio-cli/main/install.sh | bash
@@ -8,63 +8,44 @@ curl -fsSL https://raw.githubusercontent.com/jubalm/folio-cli/main/install.sh | 
 
 Requires: `git`, `gh` (GitHub CLI, authenticated).
 
-## Usage
+## Commands
 
-```bash
-folio init              # initialize a store for this project
-folio sync              # pull main + publish local edits via PR
-folio sync -m "msg"     # non-interactive (agents)
-folio list              # list all stores
-folio status            # current project/store status
-folio config            # show global config
-folio config <key>      # get a config value
-folio config <key> <v>  # set a config value
+```
+folio bind <ns/repo>         One-time: clone knowledge repo, check auth
+folio switch                 List amendments (* = active)
+folio switch -c <topic>      Create + switch to a new amendment
+folio switch <topic>         Switch to an existing amendment
+folio status                 On main | amendment: <topic> — dirty/clean/PR
+folio sync                   On main: pull. In amendment: rebase → commit → push → draft PR
+folio sync -m "msg"          Non-interactive (agents)
+folio drop <topic> --force   Abandon an amendment (local + remote)
+folio config                 Show global config
+folio config <key> [<val>]   Get or set a config value
+folio list                   List all amendments with status and PR
 ```
 
-### Init
+## Quick start
 
 ```bash
-cd ~/Projects/my-app
-folio init                         # store name = directory basename
-folio init --name custom-name      # explicit store name
-```
+# One-time setup
+folio bind jubalm/folio
 
-Creates `~/.config/folio/stores/<name>/` (a full clone of the knowledge repo).
-Writes a `.folio` pointer file in the project (gitignored globally).
+# Session start — orient and pull latest
+folio status
+folio sync
 
-### Sync
+# Capture knowledge
+folio switch -c my-topic
+# edit leaves in ~/.config/folio/stores/amendments/my-topic/leaves/
+folio sync -m "why this matters"   # submits a draft PR
 
-Edits happen in the store at `~/.config/folio/stores/<name>/leaves/`. `folio sync`:
-
-1. Pulls latest from main
-2. Surfaces any open PRs
-3. If there are local edits, commits + pushes + opens a PR
-
-```bash
-folio sync -m "decisions: fork-contingency qualifier"
-```
-
-### Status
-
-```bash
-$ folio status
-Project:  ~/Projects/my-app
-Store:    ~/.config/folio/stores/my-app
-Status:   clean
-```
-
-### List
-
-```bash
-$ folio list
-  STORE                     STATUS   BRANCH
-  augur-reboot-site         clean    main
-  hello-folio               clean    main
+# Later, abandon or switch
+folio drop my-topic --force
 ```
 
 ## How it works
 
-A 332-line bash script wrapping `git` and `gh`. No daemon, no database, no session state. Stores are plain git clones of the knowledge repo. Edits are committed, pushed to a branch, and opened as a PR. The PR body IS the editorial record.
+A 674-line bash script wrapping `git` and `gh`. No daemon, no database. Amendments are git worktrees of a single canonical clone at `~/.config/folio/stores/.main/`. Each amendment lives in `stores/amendments/<topic>/` and syncs as its own draft PR. Rebase-always keeps knowledge history linear. The PR body IS the editorial record.
 
 ## Upgrade
 

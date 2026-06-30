@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ── folio — knowledge management CLI ───────────────────────────────
-# User-scoped. Stores live in ~/.config/folio/stores/.
-# Projects carry a .folio pointer file (just the store name).
-# The CLI is a git shortcut, not a content processor.
+# ── folio — knowledge management CLI (amendments model) ────────────
+# No .folio file. User-scoped. Global config in ~/.config/folio/config.yml.
+# One active amendment at a time. Amendments are git worktrees.
 # ───────────────────────────────────────────────────────────────────
 
 FOLIO_HOME="$HOME/.config/folio"
-STORE_DIR="$FOLIO_HOME/stores"
+STORE_DIR="$FOLIO_HOME/stores"        # base clone lives here
+AMEND_DIR="$STORE_DIR/amendments"     # amendment worktrees
 CONFIG_FILE="$FOLIO_HOME/config.yml"
-REMOTE_REPO="jubalm/folio"
+BASE_REPO="$STORE_DIR/.main"          # canonical clone (shared .git)
 
 # ── helpers ────────────────────────────────────────────────────────
 
 die() { echo "folio: $*" >&2; exit 1; }
 
 ensure_folio_home() {
-  mkdir -p "$FOLIO_HOME" "$STORE_DIR"
+  mkdir -p "$FOLIO_HOME" "$STORE_DIR" "$AMEND_DIR"
   if [[ ! -f "$CONFIG_FILE" ]]; then
     cat > "$CONFIG_FILE" <<EOF
-remote: $REMOTE_REPO
+remote: jubalm/folio
 store: git
+active:
 EOF
   fi
 }
@@ -31,322 +32,8 @@ read_config() {
   grep "^$key:" "$CONFIG_FILE" | head -1 | sed "s/^$key: *//"
 }
 
-detect_project_root() {
-  local dir="$PWD"
-  while [[ "$dir" != "/" ]]; do
-    if [[ -f "$dir/.folio" ]]; then
-      echo "$dir"
-      return 0
-    fi
-    dir="$(dirname "$dir")"
-  done
-  return 1
-}
-
-detect_store_name() {
-  local project_root
-  project_root="$(detect_project_root)" || return 1
-  head -1 "$project_root/.folio"
-}
-
-# ── store name ─────────────────────────────────────────────────────
-
-make_store_name() {
-  local seed="${1:-$PWD}"
-  echo "$seed" | md5 | cut -c1-8
-}
-
-# ── store (shared clone) ───────────────────────────────────────────
-
-ensure_base() {
-  local remote="${1:-$REMOTE_REPO}"
-  local base="$STORE_DIR/.main"
-
-  if [[ -d "$base/.git" ]]; then
-    git -C "$base" fetch origin main --quiet 2>/dev/null || true
-    return 0
-  fi
-
-  echo "Initializing shared clone..."
-  git clone --quiet "git@github.com:${remote}.git" "$base" || die \
-    "Failed to clone $remote."
-  git -C "$base" config extensions.worktreeConfig true
-}
-
-# ── global gitignore ───────────────────────────────────────────────
-
-setup_global_gitignore() {
-  local gi
-  gi="$(git config --global core.excludesFile 2>/dev/null || echo "")"
-
-  # Nothing configured — pick a default and set it
-  if [[ -z "$gi" ]]; then
-    gi="$HOME/.gitignore_global"
-    git config --global core.excludesFile "$gi"
-  fi
-
-  # Resolve ~ and $HOME if git stored a literal path
-  gi="${gi/#\~/$HOME}"
-
-  touch "$gi"
-  grep -qx ".folio" "$gi" && return 0
-
-  # Ensure trailing newline if file has content
-  [[ -s "$gi" ]] && echo "" >> "$gi"
-  echo ".folio" >> "$gi"
-}
-
-# ── init ───────────────────────────────────────────────────────────
-
-cmd_init() {
-  local label=""
-  if [[ "${1:-}" == "--label" ]] || [[ "${1:-}" == "--name" ]]; then
-    label="${2:-}"
-    [[ -z "$label" ]] && die "Label required with ${1}."
-    shift 2 || true
-  fi
-  [[ -z "$label" ]] && label="$(basename "$PWD")"
-
-  # Check if already initialized from this directory
-  local project_root
-  project_root="$(detect_project_root)" && die \
-    "Already initialized ($project_root/.folio → $(head -1 $project_root/.folio))."
-
-  local name
-  name="$(make_store_name)"
-
-  # Hash collision is astronomically unlikely — guard just in case
-  if [[ -d "$STORE_DIR/$name" ]] && [[ "$name" != ".main" ]]; then
-    die "Store collision: $name (extremely unlikely)."
-  fi
-
-  ensure_folio_home
-  setup_global_gitignore
-  ensure_base "$REMOTE_REPO"
-
-  echo "Adding worktree at $STORE_DIR/$name/ ..."
-  git -C "$STORE_DIR/.main" worktree add --detach "$STORE_DIR/$name" origin/main || die \
-    "Failed to create worktree. Check that $STORE_DIR/.main exists."
-
-  git -C "$STORE_DIR/$name" config --worktree folio.label "$label"
-
-  echo "$name" > .folio
-  echo "✓ Store ready ($label)."
-}
-
-# ── sync ────────────────────────────────────────────────────────────
-
-cmd_sync() {
-  local project_root store_name store remote
-  project_root="$(detect_project_root)" || die \
-    "Not initialized. Run 'folio init' from this directory."
-  store_name="$(detect_store_name)"
-  store="$STORE_DIR/$store_name"
-  remote="$(read_config remote)"
-
-  [[ -d "$store" ]] || die "Store '$store_name' not found at $store/. Run 'folio init'."
-
-  cd "$store"
-
-  # ── fetch ──────────────────────────────────────────────────────
-
-  ensure_base "$remote"
-  git fetch origin main --quiet 2>/dev/null || die \
-    "Cannot reach $remote. Check network."
-
-  # ── surface open PRs ──────────────────────────────────────────
-
-  local prs
-  prs="$(gh pr list --repo "$remote" --state open \
-    --json number,title,headRefName --jq \
-    '.[] | "  #\(.number)  \(.title)  (\(.headRefName))"' 2>/dev/null || echo "")"
-
-  if [[ -n "$prs" ]]; then
-    echo "Open PRs:"
-    echo "$prs"
-    echo ""
-  fi
-
-  local draft_branch="folio/$store_name"
-  local current_branch
-  current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
-
-  local dirty=false
-  if ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
-    dirty=true
-  fi
-
-  # ── detached HEAD (clean slate) ──────────────────────────────────
-
-  if [[ "$current_branch" == "HEAD" ]]; then
-    if ! $dirty; then
-      git checkout --detach origin/main --quiet 2>/dev/null || true
-      echo "Nothing to push."
-      return 0
-    fi
-
-    # Resolve -m flag
-    local msg=""
-    if [[ "${1:-}" == "-m" ]]; then
-      msg="${2:-}"
-      [[ -z "$msg" ]] && die "Message required with -m."
-      shift 2 || true
-    else
-      echo -n "Message: "
-      read -r msg || true
-      [[ -z "$msg" ]] && msg="folio draft"
-    fi
-
-    echo "Creating draft..."
-    git checkout -b "$draft_branch" --quiet
-    git add -A
-    git commit -m "$msg" --quiet
-
-    echo "Pushing $draft_branch..."
-    git push -u origin "$draft_branch" --quiet 2>&1 || die "Push failed."
-
-    local pr_title="${msg%%$'\n'*}"
-    local pr_url
-    pr_url="$(gh pr create --repo "$remote" --base main --head "$draft_branch" \
-      --draft --title "$pr_title" --body "$msg" 2>&1)" || die \
-      "PR creation failed."
-
-    local pr_num="$(echo "$pr_url" | grep -oE '[0-9]+$' || echo "")"
-    echo "✓ Draft PR #$pr_num opened"
-    return 0
-  fi
-
-  # ── on draft branch ──────────────────────────────────────────────
-
-  if [[ "$current_branch" == "$draft_branch" ]]; then
-    local pr_num
-    pr_num="$(gh pr list --repo "$remote" --head "$draft_branch" --state open \
-      --json number --jq '.[0].number' 2>/dev/null || echo "")"
-
-    if [[ -z "$pr_num" ]]; then
-      # PR was merged or closed — reset
-      echo "Draft completed. Resetting..."
-      git checkout --detach origin/main --quiet 2>/dev/null || true
-      git branch -D "$draft_branch" --quiet 2>/dev/null || true
-      echo "Ready for next round."
-      return 0
-    fi
-
-    # PR is open
-    if ! $dirty; then
-      echo "Draft up to date (PR #$pr_num)."
-      return 0
-    fi
-
-    echo "Updating draft PR #$pr_num..."
-    git add -A
-
-    local update_msg="draft update"
-    if [[ "${1:-}" == "-m" ]]; then
-      update_msg="${2:-draft update}"
-    fi
-
-    git commit -m "$update_msg" --quiet
-    git push origin "$draft_branch" --quiet 2>&1 || die "Push failed."
-    echo "✓ Draft updated (PR #$pr_num)."
-    return 0
-  fi
-
-  # ── unknown branch ───────────────────────────────────────────────
-
-  die "Unexpected branch: $current_branch. Run 'git checkout --detach origin/main' in $store/ manually."
-}
-
-# ── list ───────────────────────────────────────────────────────────
-
-cmd_list() {
-  ensure_folio_home
-
-  local found=false
-  printf "  %-12s %-22s %-8s %s\n" "STORE" "LABEL" "STATUS" "BRANCH"
-
-  for store in "$STORE_DIR"/*/; do
-    [[ -d "$store" ]] || continue
-    local name="$(basename "$store")"
-    [[ "$name" == ".main" ]] && continue
-
-    found=true
-    local label="$(git -C "$store" config --worktree folio.label 2>/dev/null || echo "$name")"
-    local status="clean"
-    local branch="detach"
-
-    if ! git -C "$store" diff --quiet || \
-       ! git -C "$store" diff --cached --quiet || \
-       [[ -n "$(git -C "$store" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
-      status="dirty"
-    fi
-    branch="$(git -C "$store" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")"
-    [[ "$branch" == "HEAD" ]] && branch="detach"
-
-    printf "  %-12s %-22s %-8s %s\n" "$name" "$label" "$status" "$branch"
-  done
-
-  if ! $found; then
-    echo "No stores. Run 'folio init' from a project directory."
-  fi
-}
-
-# ── status ─────────────────────────────────────────────────────────
-
-cmd_status() {
-  local project_root store_name
-  project_root="$(detect_project_root)" || die \
-    "Not initialized. Run 'folio init' from this directory."
-  store_name="$(detect_store_name)"
-  local store="$STORE_DIR/$store_name"
-
-  echo "Project:  $project_root"
-  echo "Store:    $store"
-
-  git -C "$store" rev-parse --git-dir &>/dev/null || die \
-    "Store at $store is not a valid git worktree."
-
-  if git -C "$store" diff --quiet && git -C "$store" diff --cached --quiet && \
-     [[ -z "$(git -C "$store" ls-files --others --exclude-standard)" ]]; then
-    echo "Status:   clean"
-  else
-    echo "Status:   dirty"
-    git -C "$store" status --short
-  fi
-
-  local branch
-  branch="$(git -C "$store" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")"
-  [[ "$branch" == "HEAD" ]] && branch="detached"
-  echo "Branch:   $branch"
-
-  # Check behind from last fetch (no network call)
-  local behind=0
-  if git -C "$store" rev-parse --verify origin/main &>/dev/null; then
-    behind="$(git -C "$store" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
-  fi
-  [[ "$behind" -gt 0 ]] && echo "Behind:   $behind commit(s)"
-}
-
-# ── config ──────────────────────────────────────────────────────────
-
-cmd_config() {
-  ensure_folio_home
-  local key="${1:-}"
-  local value="${2:-}"
-
-  if [[ -z "$key" ]]; then
-    # Print all
-    cat "$CONFIG_FILE"
-    return 0
-  fi
-
-  if [[ -z "$value" ]]; then
-    # Get
-    read_config "$key"
-    return 0
-  fi
-
-  # Set
+write_config() {
+  local key="$1" value="$2"
   if grep -q "^$key:" "$CONFIG_FILE"; then
     sed -i '' "s|^$key:.*|$key: $value|" "$CONFIG_FILE"
   else
@@ -354,30 +41,633 @@ cmd_config() {
   fi
 }
 
+topic_to_slug() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
+
+check_gh() {
+  if ! command -v gh &>/dev/null; then
+    die "gh CLI not found. Install from https://cli.github.com"
+  fi
+}
+
+# ── base clone (lazy bootstrap) ────────────────────────────────────
+
+ensure_base() {
+  local remote="${1:-$(read_config remote)}"
+  [[ -z "$remote" ]] && die "No remote configured. Run 'folio bind <ns/repo>'."
+
+  if [[ -d "$BASE_REPO/.git" ]]; then
+    # Already cloned — fetch to stay warm (don't block on failure)
+    git -C "$BASE_REPO" fetch origin main --quiet 2>/dev/null || true
+    return 0
+  fi
+
+  echo "Initializing shared clone..."
+  git clone --quiet "git@github.com:${remote}.git" "$BASE_REPO" || die \
+    "Failed to clone $remote. Check access and try 'folio bind' again."
+  git -C "$BASE_REPO" config extensions.worktreeConfig true
+}
+
+# ── active amendment helpers ───────────────────────────────────────
+
+get_active() {
+  local active
+  active="$(read_config active)"
+  [[ -z "$active" || "$active" == "null" ]] && return 1
+  echo "$active"
+  return 0
+}
+
+set_active() { write_config active "$1"; }
+
+clear_active() { write_config active ""; }
+
+amendment_path() {
+  local slug
+  slug="$(topic_to_slug "$1")"
+  echo "$AMEND_DIR/$slug"
+}
+
+# ── bind ───────────────────────────────────────────────────────────
+
+cmd_bind() {
+  local remote="${1:-}"
+  [[ -z "$remote" ]] && die "Usage: folio bind <ns/repo>"
+
+  local current_remote
+  current_remote="$(read_config remote || echo "")"
+
+  if [[ "$current_remote" == "$remote" ]]; then
+    echo "Already bound to $remote."
+    return 0
+  fi
+
+  if [[ -n "$current_remote" && "$current_remote" != "jubalm/folio" ]]; then
+    local force=false
+    for a in "$@"; do [[ "$a" == "--force" ]] && force=true; done
+    if ! $force; then
+      die "Currently bound to $current_remote. All amendments will be lost. Use --force to re-bind."
+    fi
+  fi
+
+  # Auth check before any git work
+  echo "Checking access to $remote..."
+  if ! git ls-remote "git@github.com:${remote}.git" HEAD &>/dev/null; then
+    die "Cannot access $remote. Check your SSH setup or repo URL. Run: gh auth status"
+  fi
+
+  ensure_folio_home
+
+  # If base already exists from a different remote, nuke it
+  if [[ -d "$BASE_REPO/.git" ]]; then
+    local existing_remote=""
+    existing_remote="$(git -C "$BASE_REPO" remote get-url origin 2>/dev/null || echo "")"
+    if [[ "$existing_remote" != "git@github.com:${remote}.git" ]]; then
+      echo "Old clone points to a different remote. Re-cloning..."
+      rm -rf "$BASE_REPO"
+    fi
+  fi
+
+  write_config remote "$remote"
+  ensure_base "$remote"
+
+  # Fast-forward main checkout
+  git -C "$BASE_REPO" checkout main --quiet 2>/dev/null || \
+    git -C "$BASE_REPO" checkout origin/main --quiet
+  git -C "$BASE_REPO" pull --ff-only origin main --quiet 2>/dev/null || \
+    echo "  (main behind remote — run 'folio sync' to catch up)"
+
+  echo "✓ Bound to $remote."
+}
+
+# ── switch ─────────────────────────────────────────────────────────
+
+cmd_switch() {
+  ensure_folio_home
+  ensure_base
+
+  # No args → list amendments
+  if [[ $# -eq 0 ]]; then
+    local active=""
+    active="$(get_active || echo "")"
+    local found=false
+
+    printf "  %-25s %-8s %s\n" "AMENDMENT" "STATUS" "PR"
+    for dir in "$AMEND_DIR"/*/; do
+      [[ -d "$dir" ]] || continue
+      local topic
+      topic="$(basename "$dir")"
+      found=true
+
+      local status="clean"
+      if ! git -C "$dir" diff --quiet 2>/dev/null || \
+         ! git -C "$dir" diff --cached --quiet 2>/dev/null || \
+         [[ -n "$(git -C "$dir" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+        status="dirty"
+      fi
+
+      local pr_info=""
+      local branch
+      branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+      if [[ -n "$branch" && "$branch" != "HEAD" ]]; then
+        local remote_branch
+        remote_branch="$(echo "$branch" | sed 's|^refs/heads/||')"
+        local pr_num=""
+        pr_num="$(gh pr list --repo "$(read_config remote)" \
+          --head "$remote_branch" --state open \
+          --json number --jq '.[0].number' 2>/dev/null || echo "")"
+        [[ -n "$pr_num" && "$pr_num" != "null" ]] && pr_info="PR #$pr_num"
+      fi
+
+      local marker=" "
+      [[ "$topic" == "$active" ]] && marker="*"
+      printf "  %s%-24s %-8s %s\n" "$marker" "$topic" "$status" "$pr_info"
+    done
+
+    if ! $found; then
+      echo "No amendments. Run 'folio switch -c <topic>' to start one."
+    fi
+    return 0
+  fi
+
+  # Parse flags
+  local create=false
+  local force=false
+  local topic=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -c|--create) create=true; shift ;;
+      --force) force=true; shift ;;
+      *) topic="$(topic_to_slug "$1")"; shift ;;
+    esac
+  done
+
+  [[ -z "$topic" ]] && die "Usage: folio switch <topic> | folio switch -c <topic>"
+
+  local path
+  path="$(amendment_path "$topic")"
+
+  if [[ -d "$path" ]]; then
+    # Amendment exists
+    local branch
+    branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+
+    # Check if branch is merged to main (stale, want to re-open)
+    local remote="$(read_config remote)"
+    git -C "$BASE_REPO" fetch origin main --quiet 2>/dev/null || true
+    local is_merged=false
+    if [[ -n "$branch" && "$branch" != "HEAD" ]]; then
+      # Check if the remote branch is merged into main
+      if git -C "$BASE_REPO" branch -r --merged origin/main 2>/dev/null | grep -q "origin/$branch"; then
+        is_merged=true
+      fi
+    fi
+
+    if $is_merged; then
+      if $create && $force; then
+        echo "Branch '$branch' was merged to main. Deleting and creating fresh..."
+        git -C "$BASE_REPO" branch -D "$branch" 2>/dev/null || true
+        git push origin --delete "$branch" 2>/dev/null || true
+        rm -rf "$path"
+        # Fall through to create below
+      elif $create; then
+        die "amendment '$topic' already exists and was merged to main. Use --force to delete and create fresh."
+      elif ! $create; then
+        die "amendment '$topic' already exists and was merged to main. Use 'switch -c $topic --force' to start a fresh one."
+      fi
+    elif [[ -n "$branch" && "$branch" != "HEAD" ]]; then
+      # Open draft — just switch and rebase
+      if $create && ! $force; then
+        # It's an existing draft, just switch to it
+        true
+      fi
+      # Rebase onto latest main
+      echo "Rebasing $topic onto main..."
+      if ! git -C "$path" rebase origin/main --quiet 2>/dev/null; then
+        die "Rebase conflict in $topic. Resolve in $path/leaves/ then re-run 'folio sync'."
+      fi
+      git -C "$path" pull --rebase --quiet 2>/dev/null || true
+      set_active "$topic"
+      echo "✓ Switched to amendment '$topic'."
+      return 0
+    fi
+  fi
+
+  # Create new amendment worktree
+  if $create; then
+    local slug
+    slug="$(topic_to_slug "$topic")"
+    path="$AMEND_DIR/$slug"
+
+    if [[ -d "$path" ]]; then
+      die "amendment '$slug' already exists. Delete it with 'folio drop $slug' first."
+    fi
+
+    mkdir -p "$AMEND_DIR"
+
+    local remote="$(read_config remote)"
+    ensure_base "$remote"
+
+    # Ensure main is fresh
+    git -C "$BASE_REPO" checkout main --quiet 2>/dev/null || true
+    git -C "$BASE_REPO" pull --ff-only origin main --quiet 2>/dev/null || true
+
+    local branch="amend/$slug"
+    echo "Creating amendment worktree for '$slug'..."
+
+    # Create a worktree at the amendment path, on a new branch off main
+    git -C "$BASE_REPO" worktree add -b "$branch" "$path" origin/main --quiet 2>/dev/null || \
+      die "Failed to create worktree for '$slug'."
+
+    set_active "$slug"
+    echo "✓ Amendment '$slug' created."
+    echo "  leaves: $path/leaves/"
+    return 0
+  fi
+
+  # No --create and not found
+  die "amendment '$topic' not found. Use 'folio switch -c $topic' to create one."
+}
+
+# ── status ─────────────────────────────────────────────────────────
+
+cmd_status() {
+  ensure_folio_home
+
+  local active=""
+  active="$(get_active || echo "")"
+
+  if [[ -z "$active" ]]; then
+    echo "on main — no open amendments."
+
+    # Check if main checkout is dirty (informational, not blocking)
+    local leaves="$BASE_REPO/leaves"
+    if [[ -d "$leaves" ]]; then
+      if ! git -C "$BASE_REPO" diff --quiet -- leaves/ 2>/dev/null || \
+         ! git -C "$BASE_REPO" diff --cached --quiet -- leaves/ 2>/dev/null; then
+        echo "  (uncommitted edits in store/leaves/ — did you mean to amend?)"
+      fi
+    fi
+
+    local remote
+    remote="$(read_config remote || echo "")"
+    if [[ -n "$remote" ]]; then
+      local behind=0
+      if git -C "$BASE_REPO" rev-parse --verify origin/main &>/dev/null 2>/dev/null; then
+        behind="$(git -C "$BASE_REPO" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
+      fi
+      [[ "$behind" -gt 0 ]] && echo "  behind remote by $behind commit(s). Run 'folio sync'."
+    fi
+    return 0
+  fi
+
+  # In an amendment
+  echo "amendment:    $active"
+  local path
+  path="$(amendment_path "$active")"
+
+  if [[ ! -d "$path" ]]; then
+    echo "  (worktree missing — run 'folio switch -c $active' to recreate)"
+    return 0
+  fi
+
+  local branch
+  branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")"
+  echo "branch:       $branch"
+
+  # Dirty state
+  if ! git -C "$path" diff --quiet 2>/dev/null || \
+     ! git -C "$path" diff --cached --quiet 2>/dev/null || \
+     [[ -n "$(git -C "$path" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+    echo "state:        dirty"
+    git -C "$path" status --short 2>/dev/null | head -10 | sed 's/^/  /'
+  else
+    echo "state:        clean"
+  fi
+
+  # Behind count
+  if git -C "$BASE_REPO" rev-parse --verify origin/main &>/dev/null 2>/dev/null; then
+    local behind=0
+    behind="$(git -C "$BASE_REPO" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
+    [[ "$behind" -gt 0 ]] && echo "  behind main by $behind commit(s)"
+  fi
+
+  # PR
+  local remote_url
+  remote_url="$(read_config remote)"
+  if command -v gh &>/dev/null && [[ -n "$remote_url" ]]; then
+    local pr_num
+    pr_num="$(gh pr list --repo "$remote_url" --head "$branch" --state open \
+      --json number --jq '.[0].number' 2>/dev/null || echo "")"
+    if [[ -n "$pr_num" ]]; then
+      echo "pr:           https://github.com/$remote_url/pull/$pr_num"
+    fi
+  fi
+}
+
+# ── sync ───────────────────────────────────────────────────────────
+
+cmd_sync() {
+  check_gh
+
+  ensure_folio_home
+  local remote
+  remote="$(read_config remote)"
+  [[ -z "$remote" ]] && die "No remote configured. Run 'folio bind <ns/repo>'."
+  ensure_base "$remote"
+
+  # Always surface open PRs first
+  local prs
+  prs="$(gh pr list --repo "$remote" --state open \
+    --json number,title,headRefName --jq \
+    '.[] | "  #\(.number)  \(.title)  (\(.headRefName))"' 2>/dev/null || echo "")"
+  if [[ -n "$prs" ]]; then
+    echo "Open PRs:"
+    echo "$prs"
+    echo ""
+  fi
+
+  local active=""
+  active="$(get_active || echo "")"
+
+  # ── on main mode (no active amendment) ────────────────────────
+  if [[ -z "$active" ]]; then
+    echo "Pulling latest from $remote..."
+    git -C "$BASE_REPO" pull --ff-only origin main --quiet 2>/dev/null || die \
+      "Failed to pull main. Check network."
+
+    # Check for uncommitted changes in main checkout
+    if ! git -C "$BASE_REPO" diff --quiet -- leaves/ 2>/dev/null || \
+       ! git -C "$BASE_REPO" diff --cached --quiet -- leaves/ 2>/dev/null; then
+      echo "  (uncommitted edits in store/leaves/ — did you mean to amend?)"
+    fi
+
+    echo "✓ on main, synced."
+    return 0
+  fi
+
+  # ── in amendment mode ─────────────────────────────────────────
+  local path
+  path="$(amendment_path "$active")"
+  [[ -d "$path" ]] || die "Worktree for '$active' not found. Run 'folio switch -c $active'."
+
+  cd "$path"
+
+  local branch
+  branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+  [[ -z "$branch" || "$branch" == "HEAD" ]] && die "Amendment '$active' is not on a branch."
+
+  # Resolve -m flag
+  local msg=""
+  if [[ "${1:-}" == "-m" ]]; then
+    msg="${2:-}"
+    [[ -z "$msg" ]] && die "Message required with -m."
+  else
+    msg="amend: $active"
+  fi
+
+  # Check if anything to commit
+  local has_changes=false
+  if ! git -C "$path" diff --quiet 2>/dev/null || \
+     ! git -C "$path" diff --cached --quiet 2>/dev/null || \
+     [[ -n "$(git -C "$path" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+    has_changes=true
+  fi
+
+  # Commit first (if dirty)
+  if $has_changes; then
+    git -C "$path" add -A
+    git -C "$path" commit -m "$msg" --quiet
+    echo "Committed: $msg"
+  fi
+
+  # Rebase onto main (always, to keep linear history)
+  echo "Rebasing '$branch' onto main..."
+  if ! git -C "$path" rebase origin/main --quiet 2>/dev/null; then
+    die "REBASE CONFLICT in $active — resolve in $path/ then re-run 'folio sync'."
+  fi
+
+  if ! $has_changes; then
+    # Check if anything actually needs pushing (branch may be up to date)
+    local branch_remote
+    branch_remote="$(git -C "$path" rev-parse "origin/$branch" 2>/dev/null || echo "")"
+    local branch_local
+    branch_local="$(git -C "$path" rev-parse HEAD 2>/dev/null || echo "")"
+    if [[ "$branch_local" == "$branch_remote" ]]; then
+      echo "Everything up to date in '$active'."
+      return 0
+    fi
+  fi
+
+  # Force-push (draft branch, safe to rewrite)
+  if ! git -C "$path" push --force origin "$branch" --quiet 2>&1; then
+    die "Push failed. Check network and access."
+  fi
+
+  # Create or update draft PR
+  local pr_num
+  pr_num="$(gh pr list --repo "$remote" --head "$branch" --state open \
+    --json number --jq '.[0].number' 2>/dev/null || echo "")"
+
+  if [[ -z "$pr_num" ]]; then
+    local pr_title="${msg%%$'\n'*}"
+    local pr_url
+    pr_url="$(gh pr create --repo "$remote" --base main --head "$branch" \
+      --draft --title "$pr_title" --body "$msg" 2>&1)" || die "PR creation failed."
+    pr_num="$(echo "$pr_url" | grep -oE '[0-9]+$' || echo "")"
+    echo "✓ Draft PR #$pr_num created"
+  else
+    if $has_changes; then
+      gh pr edit --repo "$remote" "$pr_num" --title "${msg%%$'\n'*}" --body "$msg" 2>/dev/null || true
+    fi
+    echo "✓ Draft PR #$pr_num updated"
+  fi
+
+  echo "  https://github.com/$remote/pull/$pr_num"
+}
+
+# ── drop ───────────────────────────────────────────────────────────
+
+cmd_drop() {
+  local topic="" force=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=true; shift ;;
+      *) topic="$(topic_to_slug "$1")"; shift ;;
+    esac
+  done
+
+  [[ -z "$topic" ]] && die "Usage: folio drop <topic> [--force]"
+
+  local path
+  path="$(amendment_path "$topic")"
+  [[ ! -d "$path" ]] && die "Amendment '$topic' not found."
+
+  local branch
+  branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+  local remote
+  remote="$(read_config remote)"
+
+  # Check for open PR
+  local pr_num=""
+  if [[ -n "$branch" && "$branch" != "HEAD" ]] && command -v gh &>/dev/null && [[ -n "$remote" ]]; then
+    pr_num="$(gh pr list --repo "$remote" --head "$branch" --state open \
+      --json number --jq '.[0].number' 2>/dev/null || echo "")"
+  fi
+
+  # Check for local dirty state
+  local dirty=false
+  if ! git -C "$path" diff --quiet 2>/dev/null || \
+     ! git -C "$path" diff --cached --quiet 2>/dev/null || \
+     [[ -n "$(git -C "$path" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+    dirty=true
+  fi
+
+  # Warning message depends on state
+  if [[ -n "$pr_num" ]]; then
+    if $dirty; then
+      echo "  amendment '$topic' has an open draft PR (#$pr_num) and uncommitted changes."
+    else
+      echo "  amendment '$topic' has an open draft PR (#$pr_num)."
+    fi
+    echo "  --force will close the PR, delete the remote branch, and remove local worktree."
+  elif $dirty; then
+    echo "  amendment '$topic' has uncommitted changes. --force discards them."
+  else
+    echo "  amendment '$topic' is clean."
+  fi
+
+  if ! $force; then
+    die "Use --force to confirm deletion."
+  fi
+
+  # Close PR if open
+  if [[ -n "$pr_num" ]]; then
+    gh pr close --repo "$remote" "$pr_num" 2>/dev/null || true
+    echo "  Closed PR #$pr_num."
+  fi
+
+  # Delete remote branch
+  if [[ -n "$branch" && "$branch" != "HEAD" ]]; then
+    git push origin --delete "$branch" 2>/dev/null || true
+    echo "  Deleted remote branch '$branch'."
+  fi
+
+  # Remove worktree via git (cleaner than rm -rf)
+  git -C "$BASE_REPO" worktree remove "$path" --force 2>/dev/null || \
+    rm -rf "$path"
+
+  echo "✓ Dropped amendment '$topic'."
+
+  # Clear active if this was the active amendment
+  local active=""
+  active="$(get_active || echo "")"
+  if [[ "$active" == "$topic" ]]; then
+    clear_active
+    echo "  (active cleared — on main now)"
+  fi
+}
+
+# ── list ───────────────────────────────────────────────────────────
+
+cmd_list() {
+  ensure_folio_home
+  ensure_base 2>/dev/null || true
+
+  local active=""
+  active="$(get_active || echo "")"
+  local found=false
+
+  printf "  %-25s %-8s %s\n" "AMENDMENT" "STATUS" "PR"
+  for dir in "$AMEND_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    local topic
+    topic="$(basename "$dir")"
+    found=true
+
+    local status="clean"
+    if ! git -C "$dir" diff --quiet 2>/dev/null || \
+       ! git -C "$dir" diff --cached --quiet 2>/dev/null || \
+       [[ -n "$(git -C "$dir" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+      status="dirty"
+    fi
+
+    local pr_info=""
+    local branch
+    branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+    if [[ -n "$branch" && "$branch" != "HEAD" ]] && command -v gh &>/dev/null; then
+      local remote
+      remote="$(read_config remote)"
+      if [[ -n "$remote" ]]; then
+        local pr_num=""
+        pr_num="$(gh pr list --repo "$remote" \
+          --head "$branch" --state open \
+          --json number --jq '.[0].number' 2>/dev/null || echo "")"
+        [[ -n "$pr_num" && "$pr_num" != "null" ]] && pr_info="PR #$pr_num"
+      fi
+    fi
+
+    local marker=" "
+    [[ "$topic" == "$active" ]] && marker="*"
+
+    printf "  %s%-24s %-8s %s\n" "$marker" "$topic" "$status" "$pr_info"
+  done
+
+  if ! $found; then
+    echo "No amendments. Run 'folio switch -c <topic>' to start one."
+  fi
+}
+
+# ── config ─────────────────────────────────────────────────────────
+
+cmd_config() {
+  ensure_folio_home
+  local key="${1:-}"
+  local value="${2:-}"
+
+  if [[ -z "$key" ]]; then
+    cat "$CONFIG_FILE"
+    return 0
+  fi
+
+  if [[ -z "$value" ]]; then
+    read_config "$key"
+    return 0
+  fi
+
+  write_config "$key" "$value"
+}
+
 # ── dispatch ───────────────────────────────────────────────────────
 
 case "${1:-}" in
-  init)   shift; cmd_init "$@" ;;
+  bind)   shift; cmd_bind "$@" ;;
+  switch) shift; cmd_switch "$@" ;;
   sync)   shift; cmd_sync "$@" ;;
+  drop)   shift; cmd_drop "$@" ;;
   list)   shift; cmd_list "$@" ;;
   status) shift; cmd_status "$@" ;;
   config) shift; cmd_config "$@" ;;
   *)
     cat <<EOF
-folio — knowledge management over git
+folio — knowledge management CLI
 
 Usage:
-  folio init [--label <n>]  Initialize a store for this project
-  folio sync              Push draft PR (create or update)
-  folio sync -m "msg"     With inline message
-  folio list              List all stores (hash → label)
-  folio status            Show current project/store status
-  folio config            Show global config
-  folio config <key>      Get a config value
-  folio config <key> <v>  Set a config value
+  folio bind <ns/repo>         Bind to a knowledge repo (one-time setup)
+  folio switch                 List amendments (* = active)
+  folio switch <topic>         Switch to an existing amendment
+  folio switch -c <topic>      Create a new amendment (--force to re-create)
+  folio status                 Show current state (main | amendment)
+  folio sync [-m "msg"]        Pull main → rebase → commit → push → draft PR
+  folio drop <topic> --force   Delete an amendment (local + remote)
+  folio config                 Show global config
+  folio config <key> <value>   Set config value
 
-Edits happen in $STORE_DIR/<name>/leaves/.
-folio sync opens a draft PR; you merge when ready.
+Edits go in ~/.config/folio/store/amendments/<topic>/leaves/.
+folio sync opens a draft PR; merge via web dashboard.
 EOF
     exit 1
     ;;
