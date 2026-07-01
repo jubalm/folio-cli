@@ -22,6 +22,9 @@ folio drop <topic> --force   Abandon an amendment (local + remote)
 folio config                 Show global config
 folio config <key> [<val>]   Get or set a config value
 folio list                   List all amendments with status and PR
+folio web                    Open Folio Web or GitHub PR list for bound repo
+folio web --no-open          Print URL only
+folio dash                   Deprecated alias for 'folio web'
 ```
 
 ## Quick start
@@ -43,9 +46,24 @@ folio sync -m "why this matters"   # submits a draft PR
 folio drop my-topic --force
 ```
 
+## Web
+
+`folio web` opens the review/control surface for the bound repo. During the transition before Folio Web is deployed, it falls back to opening the GitHub PR list.
+
+```bash
+folio web                    # open in browser
+folio web --no-open          # print URL only
+```
+
+Once Folio Web is deployed, configure its URL:
+
+```bash
+folio config web https://folio.example.com
+```
+
 ## How it works
 
-A 674-line bash script wrapping `git` and `gh`. No daemon, no database. Amendments are git worktrees of a single canonical clone at `~/.config/folio/stores/.main/`. Each amendment lives in `stores/amendments/<topic>/` and syncs as its own draft PR. Rebase-always keeps knowledge history linear. The PR body IS the editorial record.
+A bash CLI wrapping `git` and `gh`. The `web` command is a thin opener — no embedded server, no daemon. Amendments are git worktrees of a single canonical clone at `~/.config/folio/stores/.main/`. Each amendment lives in `stores/amendments/<topic>/` and syncs as its own draft PR. Rebase-always keeps knowledge history linear. The PR body is the editorial record.
 
 ## Upgrade
 
