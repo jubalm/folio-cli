@@ -621,6 +621,59 @@ cmd_list() {
   fi
 }
 
+# ── web ───────────────────────────────────────────────────────────
+
+cmd_web() {
+  ensure_folio_home
+  local no_open=false
+  local print_url=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-open)  no_open=true; shift ;;
+      --print-url) print_url=true; shift ;;
+      *) die "Usage: folio web [--no-open|--print-url]" ;;
+    esac
+  done
+
+  local remote=""
+  remote="$(read_config remote || echo "")"
+  if [[ -z "$remote" ]]; then
+    die "No remote configured. Run 'folio bind <ns/repo>' first."
+  fi
+
+  local web_url=""
+  web_url="$(read_config web || echo "")"
+
+  # Determine target URL
+  local target=""
+  if [[ -n "$web_url" ]]; then
+    target="${web_url}/repos/${remote}"
+  else
+    # Fall back to GitHub PR list during transition
+    target="https://github.com/${remote}/pulls"
+  fi
+
+  if $print_url || $no_open; then
+    echo "$target"
+    return 0
+  fi
+
+  echo "Opening $target ..."
+  if command -v open &>/dev/null; then
+    open "$target" 2>/dev/null || true
+  else
+    echo "$target"
+  fi
+
+  if [[ -z "$web_url" ]]; then
+    echo
+    echo "Folio Web URL not configured."
+    echo "Set with: folio config web https://folio.example.com"
+    echo "Or connect during bind: folio bind <ns/repo> --web"
+  fi
+}
+
 # ── config ─────────────────────────────────────────────────────────
 
 cmd_config() {
@@ -651,6 +704,7 @@ case "${1:-}" in
   list)   shift; cmd_list "$@" ;;
   status) shift; cmd_status "$@" ;;
   config) shift; cmd_config "$@" ;;
+  web)    shift; cmd_web "$@" ;;
   *)
     cat <<EOF
 folio — knowledge management CLI
@@ -665,9 +719,11 @@ Usage:
   folio drop <topic> --force   Delete an amendment (local + remote)
   folio config                 Show global config
   folio config <key> <value>   Set config value
+  folio web                    Open Folio Web or GitHub PR list for bound repo
+  folio web --no-open          Print URL only
 
-Edits go in ~/.config/folio/store/amendments/<topic>/leaves/.
-folio sync opens a draft PR; merge via web dashboard.
+Edits go in ~/.config/folio/stores/amendments/<topic>/leaves/.
+folio sync opens a draft PR; merge via folio web.
 EOF
     exit 1
     ;;
