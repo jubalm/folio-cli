@@ -890,14 +890,29 @@ async function loadAll(){
   document.getElementById('health').textContent=(st.config.remote||'unbound')+' · main '+st.main.rev+(st.main.behind?' · behind '+st.main.behind:'')+(st.active?' · active '+st.active:'');
   document.getElementById('status').innerHTML='<b>Status</b><br>Remote: '+esc(st.config.remote)+'<br>Main: '+esc(st.main.rev)+' / origin '+esc(st.main.origin)+'<br>Ahead/behind: '+st.main.ahead+'/'+st.main.behind+'<br>Open PRs: '+st.openPrCount+'<br>Local amendments: '+st.localAmendmentCount+'<br>gh auth: '+(st.gh?'ok':'missing');
   var rows=await api('/api/amendments');
-  document.getElementById('list').innerHTML=rows.map(function(r){return '<div class="row" onclick="show(\\''+esc(r.topic)+'\',\''+esc((r.pr&&r.pr.number)||'')+'\\')"><b>'+esc(r.topic)+'</b> '+((r.pr&&r.pr.isDraft)?'<span class="pill draft">draft</span>':'')+(r.dirty?'<span class="pill dirty">dirty</span>':'')+(!r.local?'<span class="pill">remote-only</span>':'')+'<br><span class="muted">'+esc(r.branch)+' '+(r.pr?'· #'+r.pr.number+' '+esc(r.pr.title):'· local only')+'</span></div>'}).join('') || '<p class="muted">No amendments.</p>';
+  var list=document.getElementById('list');
+  list.innerHTML=rows.map(function(r){
+    var pr=(r.pr&&r.pr.number)||'';
+    return '<div class="row" data-topic="'+esc(r.topic)+'" data-pr="'+esc(pr)+'"><b>'+esc(r.topic)+'</b> '+((r.pr&&r.pr.isDraft)?'<span class="pill draft">draft</span>':'')+(r.dirty?'<span class="pill dirty">dirty</span>':'')+(!r.local?'<span class="pill">remote-only</span>':'')+'<br><span class="muted">'+esc(r.branch)+' '+(r.pr?'· #'+r.pr.number+' '+esc(r.pr.title):'· local only')+'</span></div>';
+  }).join('') || '<p class="muted">No amendments.</p>';
+  Array.prototype.forEach.call(list.querySelectorAll('.row'), function(el){
+    el.addEventListener('click', function(){ show(el.dataset.topic, el.dataset.pr || ''); });
+  });
 }
 async function show(topic, pr){
   var d=await api('/api/detail?topic='+encodeURIComponent(topic)+'&pr='+encodeURIComponent(pr)); var p=d.pr||{};
-  var actions='<div class="actions"><button onclick="action({action:\\'sync-amendment\\',topic:\\''+esc(d.item.topic)+'\\'})">Sync</button>';
-  if(p.number){actions += '<button onclick="action({action:\\'ready\\',pr:'+p.number+'})">Mark ready</button><button class="danger" onclick="mergePr('+p.number+')">Squash merge</button>';}
-  actions += '<button class="danger" onclick="dropTopic(\\''+esc(d.item.topic)+'\\')">Drop</button></div>';
-  document.getElementById('detail').innerHTML='<h2>'+esc(d.item.topic)+' '+(p.number?'<span class="pill">#'+p.number+'</span>':'')+'</h2><p class="muted">'+esc(d.item.branch)+' '+(d.item.local?'· '+esc(d.item.path):'· remote-only')+'</p><p>'+(p.url?'<a href="'+esc(p.url)+'">Open on GitHub</a>':'')+'</p>'+actions+'<h3>Files</h3><pre>'+esc([].concat(d.files.committed||[],d.files.local||[]).join('\\n')||'(none)')+'</pre><h3>PR body</h3><pre>'+esc(p.body||'(no PR body)')+'</pre><h3>Diff</h3><pre>'+esc(d.diff||'(no diff)')+'</pre>';
+  var actions='<div class="actions"><button id="sync-amendment">Sync</button>';
+  if(p.number){actions += '<button id="ready-pr">Mark ready</button><button id="merge-pr" class="danger">Squash merge</button>';}
+  actions += '<button id="drop-topic" class="danger">Drop</button></div>';
+  var detail=document.getElementById('detail');
+  detail.innerHTML='<h2>'+esc(d.item.topic)+' '+(p.number?'<span class="pill">#'+p.number+'</span>':'')+'</h2><p class="muted">'+esc(d.item.branch)+' '+(d.item.local?'· '+esc(d.item.path):'· remote-only')+'</p><p>'+(p.url?'<a href="'+esc(p.url)+'">Open on GitHub</a>':'')+'</p>'+actions+'<h3>Files</h3><pre>'+esc([].concat(d.files.committed||[],d.files.local||[]).join('\\n')||'(none)')+'</pre><h3>PR body</h3><pre>'+esc(p.body||'(no PR body)')+'</pre><h3>Diff</h3><pre>'+esc(d.diff||'(no diff)')+'</pre>';
+  document.getElementById('sync-amendment').addEventListener('click', function(){ action({action:'sync-amendment',topic:d.item.topic}); });
+  var drop=document.getElementById('drop-topic');
+  if(drop) drop.addEventListener('click', function(){ dropTopic(d.item.topic); });
+  var ready=document.getElementById('ready-pr');
+  if(ready) ready.addEventListener('click', function(){ action({action:'ready',pr:p.number}); });
+  var merge=document.getElementById('merge-pr');
+  if(merge) merge.addEventListener('click', function(){ mergePr(p.number); });
 }
 async function action(body){try{var out=await api('/api/action',{method:'POST',body:body}); alert(out.stdout||JSON.stringify(out)); await loadAll();}catch(e){alert(e.message)}}
 function mergePr(pr){var c=prompt('Type: merge #'+pr); if(c) action({action:'merge',pr:pr,confirm:c});}
