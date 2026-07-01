@@ -674,13 +674,6 @@ cmd_web() {
   fi
 }
 
-# ── dash (deprecated) ──────────────────────────────────────────────
-
-cmd_dash() {
-  echo "folio dash is deprecated — use 'folio web' instead." >&2
-  cmd_web "$@"
-}
-
 # ── config ─────────────────────────────────────────────────────────
 
 cmd_config() {
@@ -712,7 +705,6 @@ case "${1:-}" in
   status) shift; cmd_status "$@" ;;
   config) shift; cmd_config "$@" ;;
   web)    shift; cmd_web "$@" ;;
-  dash)   shift; cmd_dash "$@" ;;  # deprecated, same as web
   *)
     cat <<EOF
 folio — knowledge management CLI
@@ -729,7 +721,6 @@ Usage:
   folio config <key> <value>   Set config value
   folio web                    Open Folio Web or GitHub PR list for bound repo
   folio web --no-open          Print URL only
-  folio dash                   Deprecated alias for 'folio web'
 
 Edits go in ~/.config/folio/stores/amendments/<topic>/leaves/.
 folio sync opens a draft PR; merge via folio web.

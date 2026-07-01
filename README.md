@@ -24,7 +24,6 @@ folio config <key> [<val>]   Get or set a config value
 folio list                   List all amendments with status and PR
 folio web                    Open Folio Web or GitHub PR list for bound repo
 folio web --no-open          Print URL only
-folio dash                   Deprecated alias for 'folio web'
 ```
 
 ## Quick start
